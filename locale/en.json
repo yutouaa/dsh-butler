@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Butler",
+    "description": "One butler per workspace: see what every session in the workspace is doing, digest memory and skills in one call, and dispatch a task to another session by role name, title or id. Switch it on or off per workspace from the sidebar menu."
+  }
+}

@@ -1,0 +1,17 @@
+# dsh-butler — bundle patch layer
+# 挂一行 loader 记录：注册 butler_sessions / butler_digest / butler_roles / butler_dispatch 四个工具
+# 和随包的 butler 技能。下面是默认配置；要改请在 profile 自己的 cordis.patch.yml 里覆盖：
+#
+#   - id: butler
+#     config:
+#       defaultEnabled: false      # 改成「要先在工作区菜单里启用才生效」
+#       maxDispatchesPerHour: 5
+#
+- insert:
+    - id: butler
+      name: dsh-butler
+      config:
+        defaultEnabled: true
+        maxDispatchesPerHour: 20
+        dispatchDelaySeconds: 3
+        dryRun: false

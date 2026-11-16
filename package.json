@@ -1,0 +1,83 @@
+{
+  "name": "dsh-butler",
+  "version": "0.2.0",
+  "description": "One butler per workspace for DeepSeek Harness: see what every session in the workspace is doing, digest memory and skills in one call, and dispatch a task to another session by role name, title or id. Switch it on or off per workspace from the sidebar menu.",
+  "type": "module",
+  "main": "lib/index.mjs",
+  "exports": {
+    ".": "./lib/index.mjs",
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "skills/",
+    "locale/",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\" && node test/indexer.selftest.mjs"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "butler",
+    "sessions",
+    "dispatch",
+    "multi-session",
+    "orchestration"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.2-rc.1 <0.3.0-0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.1.0",
+    "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/schemastery": "^3.19.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-context-menu"
+      ],
+      "platform": "web"
+    },
+    "engines": {
+      "dsh": ">=0.2.2-rc.1 <0.3.0-0"
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.2.2-rc.3": "experimental"
+      }
+    }
+  }
+}
