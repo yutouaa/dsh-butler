@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`dsh-butler` is a **DeepSeek Harness (DSH) plugin** (cordis 4), not a standalone Node library. It registers four tools — `butler_sessions`, `butler_digest`, `butler_roles`, `butler_dispatch` — plus a bundled `butler` skill, so one DSH session can see the other sessions in its workspace and dispatch work to them. The model is **one butler per workspace**: every tool is confined to the caller's workspace, and a sidebar menu item switches the butler on or off per workspace. Tool descriptions, tool output, the skill and the primary README are in Chinese; keep them that way (`README.en.md` is the English mirror — update both).
+`dsh-butler` is a **DeepSeek Harness (DSH) plugin** (cordis 4), not a standalone Node library. It registers four tools — `butler_sessions`, `butler_digest`, `butler_roles`, `butler_dispatch` — plus a bundled `butler` skill, so one dedicated session can see the other sessions in its workspace and dispatch work to them. The model is **one dedicated butler session per workspace**: a sidebar menu item "启用管家" creates (or reuses) a session titled "管家" in that workspace, and the four tools work **only from that session** and only on that workspace. Every other session is refused. Tool descriptions, tool output, the skill and the primary README are in Chinese; keep them that way (`README.en.md` is the English mirror — update both).
 
 The `@deepseek-ai/*` imports are injected by the host at runtime and **do not exist on disk**. `npm install`, `tsc` and static analysis will report "Cannot find module" — expected. Do not add them as dependencies or bundle them. There is no build step and no linter.
 
@@ -48,21 +48,25 @@ lib/indexer.mjs    data layer (zero deps, also a CLI): session projection cache,
 lib/resolve.mjs    target string -> top-level sessionId (id | role | exact title | unique fuzzy title)
 lib/dispatch.mjs   self/empty guard -> rate limit -> dryRun -> in-process delivery -> schedule fallback; audits every outcome
 lib/roles.mjs      <dshHome>/butler/roles.json  (sessionId -> {role, job}); role names unique among workspace peers
-lib/state.mjs      readJson/writeJson + <dshHome>/butler/workspaces.json (workspaceId -> enabled)
-lib/route.mjs      HTTP handler for /dsh-butler/workspaces (GET state, POST toggle)
+lib/state.mjs      readJson/writeJson + <dshHome>/butler/workspaces.json (workspaceId -> {enabled, sessionId})
+lib/enable.mjs     setWorkspaceEnabled: enable = reuse the recorded butler session or create one (create -> rename -> intro); disable = flip the flag only
+lib/route.mjs      HTTP handler for /dsh-butler/workspaces (GET state, POST toggle; awaits session creation)
 lib/audit.mjs      <dshHome>/butler/audit.jsonl (also the rate-limit counter)
 lib/skill.mjs      skill provider serving skills/butler/SKILL.md
 lib/client.js      UI half (browser script, not ESM): adds the enable/disable item to the workspace menu
 ```
 
-`butler_dispatch` flow: `index.mjs` → `scopeOf` → `resolveTarget` → `dispatchToSession`. The other tools go `scopeOf` → `indexer.mjs` / `roles.mjs`. `dshHome` is resolved once in `apply` and passed explicitly everywhere; none of the helpers has a default for it.
+`butler_dispatch` flow: `index.mjs` → `scopeOf` (butler-session check) → `resolveTarget` → `dispatchToSession`. The other tools go `scopeOf` → `indexer.mjs` / `roles.mjs`. `dshHome` is resolved once in `apply` and passed explicitly everywhere; none of the helpers has a default for it.
 
-### Workspace scope and the per-workspace switch
+### Butler session, workspace scope and the per-workspace switch
 
-- Every tool starts with `scopeOf(exec)` in `index.mjs`: session cwd → `findWorkspace` (longest registered workspace path containing it) → refuse if that workspace is disabled → return the workspace id as the session filter. A cwd outside every registered workspace follows `defaultEnabled` and is scoped to that directory.
+- Every tool starts with `scopeOf(exec)` in `index.mjs`: session cwd → `findWorkspace` (longest registered workspace path containing it; none → refuse) → refuse if that workspace is not enabled → refuse unless `exec.agent.session.id` equals the recorded `sessionId` → return the workspace id as the session filter. There is no default-enabled mode and no config override of the workspace.
+- Enabling uses the host's `sessionController`: `create({ workspaceId })` (creates the session and attaches it to the workspace), `rename({ sessionId, title })`, then `deliverInProcess` for the intro message. The state is saved right after `create`, before rename/intro, which are best-effort. A recorded session is reused if the projection cache shows it unarchived, or — when the cache hasn't seen it yet — if `resolveAgent` finds it. Disabling keeps the `sessionId`.
+- Tool descriptions are visible in every session's context (DSH has no per-session tool visibility), so they start with 【仅本工作区的管家会话可用】 and the skill tells non-butler sessions not to use them.
 - All session lookups (`listSessions`, `buildDigest`, `resolveTarget`, role peers) take that filter, so a target in another workspace is simply "not found here". There is deliberately no cross-workspace escape hatch.
 - Membership is derived from cwd, not from the host's `workspace.json` `sessionIds` lists. The two agreed exactly on real data; they can diverge only when two workspaces share or nest paths.
-- The switch has two halves. Host: `ctx.inject(["webServer"], …)` registers `workspacesHandler`; a POST must come from the DSH window (`connection.browserAuth.isAuthenticated`), so a model with shell access cannot enable the butler for itself — when the host has no `connection` service the check is skipped. UI: `lib/client.js` is loaded by the web client via `exports["./client"]` and `dsh.client` in `package.json`; it must stay a dependency-free `window.__ModuleLoader__.load({ id, factory })` script returning `{ inject, apply }`, and it registers one data-only item through `ctx.contextMenus.register({ target: "workspace", … })`. If the route is unreachable it returns no item rather than breaking the menu.
+- `ctx.inject(["sessionController", "sessions"], …)` needs **both** services; if either is missing neither is available and enabling fails with "宿主没有 sessionController".
+- The switch has two halves. Host: `ctx.inject(["webServer"], …)` registers `workspacesHandler`; a POST must come from the DSH window (`connection.browserAuth.isAuthenticated`), so a model with shell access cannot enable the butler for itself — when the host has no `connection` service the check is skipped. Unknown workspace ids are 404, so arbitrary keys never reach `workspaces.json`. UI: `lib/client.js` is loaded by the web client via `exports["./client"]` and `dsh.client` in `package.json`; it must stay a dependency-free `window.__ModuleLoader__.load({ id, factory })` script returning `{ inject, apply }`, and it registers one data-only item through `ctx.contextMenus.register({ target: "workspace", … })`. If the route is unreachable it returns no item rather than breaking the menu.
 
 ### Service access (the thing most likely to break silently)
 
@@ -94,14 +98,14 @@ Only top-level sessions (`session-<uuid>`) of the caller's workspace are valid t
 
 ### Invariants
 
-- The plugin writes **only** under `<dshHome>/butler/` (`roles.json`, `workspaces.json`, `audit.jsonl`, `last-load.json`). The indexer CLI's `--out` refuses paths inside `DSH_HOME`.
+- The plugin writes **only** under `<dshHome>/butler/` (`roles.json`, `workspaces.json`, `audit.jsonl`, `last-load.json`). The one other side effect is the butler session created on enable; nothing else creates or messages sessions except `butler_dispatch`. The indexer CLI's `--out` refuses paths inside `DSH_HOME`.
 - Every dispatch attempt appends to `audit.jsonl` (`scheduled` / `failed` / `rate-limited` / `dry-run`); the hourly limit counts `scheduled` entries only.
 - No outbound network access; the only HTTP is the UI half calling the local host route.
 
 ## Publishing layout
 
-`files` in `package.json` is the whitelist: `lib/`, `skills/`, `locale/`, `cordis.patch.yml`, both READMEs, `CHANGELOG.md`, `LICENSE`. Bump `version` and add a `CHANGELOG.md` entry together; `last-load.json` reports the version from `package.json`.
+`files` in `package.json` is the whitelist: `lib/`, `skills/`, `locale/`, `cordis.patch.yml`, both READMEs, `CHANGELOG.md`, `LICENSE`. Bump `version` and add a `CHANGELOG.md` entry together; `last-load.json` reports the version from `package.json`. A published version cannot be republished, so changes after a release need a new version. The npm name `dsh-butler` belongs to an unrelated package (`fegnze/dsh-butler`) — this plugin is not published to npm and must not be; the market installs it from GitHub.
 
-Market listing is not done from this repo: the DSH plugin market reads the curated `awesome-dsh-plugin/awesome-dsh-plugin` registry on GitHub, so a plugin is listed by publishing to npm and opening a PR there. `dsh.compatibility.dshReleases` is `experimental` until real cross-session delivery has been confirmed in a host.
+Market listing is not done from this repo: the DSH plugin market reads the curated `awesome-dsh-plugin/awesome-dsh-plugin` registry on GitHub, so a plugin is listed by opening a PR there (npm publishing is not required, and the npm name is taken). `dsh.compatibility.dshReleases` is `experimental` until real cross-session delivery has been confirmed in a host.
 
 `_local/` is gitignored and unpublished: one-off host-inspection scripts, reverse-engineering notes on the host's delivery API (`_local/recon/delivery-api.md` is the evidence behind the dispatch contract), the pre-0.2 data layer, and sample output generated from real sessions. It contains personal paths and session content — never move anything from it into the published tree without scrubbing.

@@ -1,7 +1,7 @@
 {
   "name": "dsh-butler",
-  "version": "0.2.0",
-  "description": "One butler per workspace for DeepSeek Harness: see what every session in the workspace is doing, digest memory and skills in one call, and dispatch a task to another session by role name, title or id. Switch it on or off per workspace from the sidebar menu.",
+  "version": "0.2.1",
+  "description": "A dedicated butler session per workspace for DeepSeek Harness: enable it from the sidebar workspace menu, then use it to see what every session in the workspace is doing, digest memory and skills in one call, and dispatch a task to another session by role name, title or id.",
   "type": "module",
   "main": "lib/index.mjs",
   "exports": {

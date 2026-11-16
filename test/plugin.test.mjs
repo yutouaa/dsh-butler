@@ -53,7 +53,7 @@ function makeCtx(services, tools) {
   return scope([]);
 }
 
-async function setup({ services = {}, config = {} } = {}) {
+async function setup({ services = {}, config = {}, workspaces } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "butler-test-"));
   const ws = path.join(home, "ws");
   const wsOther = path.join(home, "ws-other");
@@ -74,11 +74,19 @@ async function setup({ services = {}, config = {} } = {}) {
     tables: { workspaces: { w1: { path: ws, title: "WS" }, w2: { path: wsOther, title: "Other" } } },
   }));
 
+  // 默认两个工作区都启用了管家：WS 的管家会话是 ID.me，Other 的是 ID.other
+  fs.mkdirSync(path.join(home, "butler"), { recursive: true });
+  fs.writeFileSync(path.join(home, "butler", "workspaces.json"), JSON.stringify(
+    workspaces ?? { w1: { enabled: true, sessionId: ID.me }, w2: { enabled: true, sessionId: ID.other } },
+  ));
+
   const tools = [];
   await plugin.apply(makeCtx(services, tools), { dshHome: home, ...config });
   const execIn = (id, cwd) => ({ agent: { session: { id, cwd } } });
   const call = (name, args = {}, exec = execIn(ID.me, ws)) => tools.find((t) => t.name === name).execute(args, exec);
-  /** 以另一个工作区里那个会话的身份调用 */
+  /** 以 WS 工作区里指定会话的身份调用 */
+  const callAs = (id, name, args = {}) => call(name, args, execIn(id, ws));
+  /** 以另一个工作区里那个管家会话的身份调用 */
   const callOther = (name, args = {}) => call(name, args, execIn(ID.other, wsOther));
   const audit = () => {
     try {
@@ -87,7 +95,8 @@ async function setup({ services = {}, config = {} } = {}) {
       return [];
     }
   };
-  return { home, tools, call, callOther, audit };
+  const savedWorkspaces = () => JSON.parse(fs.readFileSync(path.join(home, "butler", "workspaces.json"), "utf8"));
+  return { home, tools, call, callAs, callOther, audit, savedWorkspaces };
 }
 
 /** 假的 HTTP 请求/响应：调 handler，返回 { status, body } */
@@ -127,6 +136,36 @@ function inProcess() {
     services: {
       sessionController: { resolveAgent: async (id) => (id === ID.tests ? { agent } : { error: { code: "session/not-found" } }) },
       sessions: { flush: async (s) => { flushed.push(s); return true; } },
+    },
+  };
+}
+
+/**
+ * 能建会话的宿主桩：create / rename / resolveAgent / flush。
+ * existing 里的会话 resolveAgent 能找到；其它都是 session/not-found。
+ */
+function butlerHost({ existing = [], createFails = false } = {}) {
+  const created = [];
+  const renamed = [];
+  const sent = [];
+  const agent = { session: { id: "agent" }, followup: (m) => sent.push(m) };
+  let n = 0;
+  return {
+    created,
+    renamed,
+    sent,
+    services: {
+      sessionController: {
+        create: async (req) => {
+          if (createFails) throw new Error("boom");
+          created.push(req);
+          return { sessionId: `session-bbbb9999-9999-9999-9999-99999999999${++n}` };
+        },
+        rename: async (req) => { renamed.push(req); },
+        // 新建出来的会话宿主当然找得到
+        resolveAgent: async (id) => (existing.includes(id) || id.startsWith("session-bbbb9999") ? { agent } : { error: { code: "session/not-found" } }),
+      },
+      sessions: { flush: async () => true },
     },
   };
 }
@@ -260,44 +299,110 @@ test("岗位名只在工作区内唯一，各工作区的岗位表互不可见",
   await assert.rejects(callOther("butler_dispatch", { target: "测试岗", message: "x", dryRun: true }), /自己/);
 });
 
-test("按工作区启停：停用后四个工具都拒绝，别的工作区不受影响", async () => {
+test("只有被指定的管家会话能用工具，同工作区的别的会话不行", async () => {
+  const { callAs } = await setup();
+  for (const [name, args] of [["butler_sessions", {}], ["butler_digest", {}], ["butler_roles", { action: "list" }], ["butler_dispatch", { target: "查日志 alpha", message: "x", dryRun: true }]]) {
+    await assert.rejects(callAs(ID.tests, name, args), /只有工作区「WS」的管家会话/, name);
+  }
+  assert.ok((await callAs(ID.me, "butler_sessions")).text.includes("跑测试"));
+});
+
+test("没有管家会话、或工作区不在登记表里时工具拒绝", async () => {
+  const { call } = await setup({ workspaces: {} });
+  await assert.rejects(call("butler_sessions"), /没有启用管家/);
+  const { tools } = await setup();
+  await assert.rejects(
+    tools.find((t) => t.name === "butler_sessions").execute({}, { agent: { session: { id: ID.me, cwd: path.join(os.tmpdir(), "nowhere") } } }),
+    /不在任何已登记的工作区/,
+  );
+});
+
+test("启用管家：新建会话、改名、发开场白，之后只有它能用工具", async () => {
   const web = webServer(true);
-  const { call, callOther } = await setup({ services: web.services });
-  assert.equal(web.routes.length, 1);
-  assert.equal(web.routes[0].path, "/dsh-butler/workspaces");
+  const host = butlerHost();
+  const { callAs, savedWorkspaces } = await setup({ services: { ...web.services, ...host.services }, workspaces: {} });
+  const { handler } = web.routes[0];
+  assert.deepEqual((await http(handler, "GET")).body, { workspaces: {} });
+
+  const res = await http(handler, "POST", { workspaceId: "w1", enabled: true });
+  assert.equal(res.status, 200);
+  const sessionId = res.body.sessionId;
+  assert.equal(res.body.created, true);
+  assert.deepEqual(host.created, [{ workspaceId: "w1" }]);
+  assert.deepEqual(host.renamed, [{ sessionId, title: "管家" }]);
+  assert.equal(host.sent.length, 1);
+  assert.match(host.sent[0].content[0].text, /「WS」的管家会话/);
+  assert.deepEqual(savedWorkspaces(), { w1: { enabled: true, sessionId } });
+  assert.deepEqual((await http(handler, "GET")).body.workspaces, { w1: { enabled: true, sessionId } });
+
+  assert.ok((await callAs(sessionId, "butler_sessions")).text.includes("跑测试"));
+  await assert.rejects(callAs(ID.me, "butler_sessions"), /只有工作区「WS」的管家会话/);
+});
+
+test("停用后工具都拒绝，再启用复用同一个管家会话；别的工作区不受影响", async () => {
+  const web = webServer(true);
+  const host = butlerHost({ existing: [ID.me] });
+  const { callAs, callOther, savedWorkspaces } = await setup({ services: { ...web.services, ...host.services } });
   const { handler } = web.routes[0];
 
-  assert.deepEqual((await http(handler, "GET")).body, { defaultEnabled: true, workspaces: {} });
   assert.equal((await http(handler, "POST", { workspaceId: "w1", enabled: false })).status, 200);
-  assert.deepEqual((await http(handler, "GET")).body.workspaces, { w1: false });
-
-  for (const [name, args] of [["butler_sessions", {}], ["butler_digest", {}], ["butler_roles", { action: "list" }], ["butler_dispatch", { target: "跑测试", message: "x", dryRun: true }]]) {
-    await assert.rejects(call(name, args), /没有启用管家/, name);
-  }
+  assert.deepEqual(savedWorkspaces().w1, { enabled: false, sessionId: ID.me });
+  await assert.rejects(callAs(ID.me, "butler_sessions"), /没有启用管家/);
   assert.ok((await callOther("butler_sessions")).text.includes("别处的会话"));
 
-  await http(handler, "POST", { workspaceId: "w1", enabled: true });
-  assert.ok((await call("butler_sessions")).text.includes("跑测试"));
+  const again = await http(handler, "POST", { workspaceId: "w1", enabled: true });
+  assert.deepEqual([again.body.sessionId, again.body.created], [ID.me, false]);
+  assert.equal(host.created.length, 0);
+  assert.equal(host.sent.length, 0); // 复用时不再发开场白
+  assert.ok((await callAs(ID.me, "butler_sessions")).text.includes("跑测试"));
 });
 
-test("defaultEnabled=false 时要先在工作区菜单里启用", async () => {
+test("记下的管家会话已归档或已不存在时，启用会另建一个", async () => {
+  for (const gone of [ID.archived, "session-deaddead-0000-0000-0000-000000000000"]) {
+    const web = webServer(true);
+    const host = butlerHost();
+    const { savedWorkspaces } = await setup({ services: { ...web.services, ...host.services }, workspaces: { w1: { enabled: false, sessionId: gone } } });
+    const res = await http(web.routes[0].handler, "POST", { workspaceId: "w1", enabled: true });
+    assert.equal(res.body.created, true, gone);
+    assert.notEqual(res.body.sessionId, gone);
+    assert.equal(savedWorkspaces().w1.sessionId, res.body.sessionId);
+  }
+});
+
+test("开场白发不出去也不影响启用，建会话失败则不写开关", async () => {
   const web = webServer(true);
-  const { call } = await setup({ services: web.services, config: { defaultEnabled: false } });
-  await assert.rejects(call("butler_sessions"), /没有启用管家/);
-  await http(web.routes[0].handler, "POST", { workspaceId: "w1", enabled: true });
-  assert.ok((await call("butler_sessions")).text.includes("跑测试"));
+  const host = butlerHost();
+  host.services.sessions.flush = async () => false; // 持久化不确认，开场白算失败
+  const ok = await setup({ services: { ...web.services, ...host.services }, workspaces: {} });
+  const res = await http(web.routes[0].handler, "POST", { workspaceId: "w1", enabled: true });
+  assert.equal(res.status, 200);
+  assert.equal(ok.savedWorkspaces().w1.enabled, true);
+
+  const web2 = webServer(true);
+  const failing = await setup({ services: { ...web2.services, ...butlerHost({ createFails: true }).services }, workspaces: {} });
+  const bad = await http(web2.routes[0].handler, "POST", { workspaceId: "w1", enabled: true });
+  assert.equal(bad.status, 500);
+  assert.match(bad.body.error, /boom/);
+  assert.deepEqual(failing.savedWorkspaces(), {});
+
+  const web3 = webServer(true);
+  await setup({ services: web3.services, workspaces: {} }); // 宿主没有 sessionController
+  const none = await http(web3.routes[0].handler, "POST", { workspaceId: "w1", enabled: true });
+  assert.equal(none.status, 500);
+  assert.match(none.body.error, /sessionController/);
 });
 
-test("开关路由：没带窗口会话 cookie 的修改被拒，坏请求 400", async () => {
+test("开关路由：没带窗口会话 cookie 的修改被拒，未知工作区 404，坏请求 400", async () => {
   const outside = webServer(false);
-  await setup({ services: outside.services });
+  const { savedWorkspaces } = await setup({ services: { ...outside.services, ...butlerHost().services } });
   assert.equal((await http(outside.routes[0].handler, "POST", { workspaceId: "w1", enabled: false })).status, 401);
-  assert.deepEqual((await http(outside.routes[0].handler, "GET")).body.workspaces, {}); // 读不受限，且上面的修改没生效
+  assert.equal(savedWorkspaces().w1.enabled, true); // 读不受限，且上面的修改没生效
 
   const unknown = webServer(undefined); // 宿主没有 connection 服务：无法判断，放行
-  await setup({ services: unknown.services });
+  await setup({ services: { ...unknown.services, ...butlerHost().services } });
   const { handler } = unknown.routes[0];
   assert.equal((await http(handler, "POST", { workspaceId: "w1", enabled: false })).status, 200);
+  assert.equal((await http(handler, "POST", { workspaceId: "nope", enabled: true })).status, 404);
   assert.equal((await http(handler, "POST", { workspaceId: "w1" })).status, 400);
   assert.equal((await http(handler, "POST", "not json")).status, 400);
   assert.equal((await http(handler, "DELETE")).status, 405);
@@ -306,13 +411,13 @@ test("开关路由：没带窗口会话 cookie 的修改被拒，坏请求 400",
 test("界面端：往工作区菜单注册一项启停开关", async () => {
   let loaded;
   const calls = [];
-  let state = { defaultEnabled: true, workspaces: {} };
+  let state = { workspaces: {} };
   globalThis.window = { __ModuleLoader__: { load: (m) => { loaded = m; } } };
   globalThis.fetch = async (url, init) => {
     calls.push({ url, method: init.method, body: init.body });
     if (init.method === "POST") {
       const b = JSON.parse(init.body);
-      state = { ...state, workspaces: { ...state.workspaces, [b.workspaceId]: b.enabled } };
+      state = { workspaces: { ...state.workspaces, [b.workspaceId]: { enabled: b.enabled, sessionId: "session-x" } } };
     }
     return { ok: true, json: async () => state };
   };
@@ -332,15 +437,18 @@ test("界面端：往工作区菜单注册一项启停开关", async () => {
     assert.equal(registered[0].target, "workspace");
 
     const target = { workspaceId: "w1", displayTitle: "WS" };
+    // 文案随运行环境的语言在中英文之间切换
+    const [on] = await registered[0].resolve(target);
+    assert.ok(["启用管家", "Enable butler"].includes(on.label), on.label); // 还没启用，给的是「启用」
+    await on.run();
+    assert.deepEqual(JSON.parse(calls.at(-1).body), { workspaceId: "w1", enabled: true });
+    assert.equal(calls.at(-1).url, "/dsh-butler/workspaces");
+    assert.ok(notices[0].includes("WS"));
+
     const [off] = await registered[0].resolve(target);
-    // 默认启用，所以给的是「停用」；文案随运行环境的语言在中英文之间切换
     assert.ok(["停用管家", "Disable butler"].includes(off.label), off.label);
     await off.run();
     assert.deepEqual(JSON.parse(calls.at(-1).body), { workspaceId: "w1", enabled: false });
-    assert.equal(calls.at(-1).url, "/dsh-butler/workspaces");
-    assert.ok(notices[0].includes("WS"));
-    const [on] = await registered[0].resolve(target);
-    assert.ok(["启用管家", "Enable butler"].includes(on.label), on.label);
 
     globalThis.fetch = async () => { throw new Error("offline"); };
     assert.deepEqual(await registered[0].resolve(target), []); // 取不到状态就不显示菜单项

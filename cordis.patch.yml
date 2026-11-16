@@ -4,14 +4,13 @@
 #
 #   - id: butler
 #     config:
-#       defaultEnabled: false      # 改成「要先在工作区菜单里启用才生效」
 #       maxDispatchesPerHour: 5
 #
+# 管家本身在侧栏工作区的「…」菜单里按工作区启用，不在这里配置。
 - insert:
     - id: butler
       name: dsh-butler
       config:
-        defaultEnabled: true
         maxDispatchesPerHour: 20
         dispatchDelaySeconds: 3
         dryRun: false
